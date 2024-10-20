@@ -1,0 +1,222 @@
+---
+title: Kubernetes Data Only Backup with K8up
+date: '2024-10-19'
+tags: ['kubernetes', 'backup']
+draft: false
+summary: There are many Kubernetes Backup solutions available, however not many of those support only backing up data. This post shows how to achieve exactly that with K8up.
+---
+
+# Introduction
+
+Backing up your data is an essential port of any IT infrastructure. In Kubernetes, one has to distinguish between
+backing up the Kubernetes resouces (like deployments, services, etc.) and backing up the data. In our environment,
+we're using a full GitOps approach, meaning that all Kubernetes resources are stored in Git and synced to the cluster
+using [ArgoCD](https://argoproj.github.io/argo-cd/). This means we're not really interested in backing up the Kubernetes
+resources, as they can be easily restored from Git.
+
+Naturally, there are some applications which do store persistent data, such as PostgreSQL databases, OpenSearch or EMQX.
+There are many backup solutions available for Kubernetes, some examples include [Velero](https://velero.io), [Stash](https://stash.run), or [Kasten](https://kasten.io), but there are many more.
+Most of these solutions cannot backup only data though, they're designed to backup the resources as well. Refer to this [Velero issue](https://github.com/vmware-tanzu/velero/issues/7345), just as one example.
+
+# K8up
+
+[K8up](https://k8up.io/) is a backup operator for Kubernetes, based on Restic, which can be used to do exactly that:
+backup only the data. Its a CNCF sandbox project, it's actively maintained and has a growing community.
+It supports two types of backups:
+
+- **Volume backups**: This is a backup of the entire volume, including all data on it. There are certain annotations to include or exclude PVCs from being backed up.
+- **Application-aware backups**: This is a more flexible backup, which allows you to run a command and **backup the output** of it.
+
+One quite common approach is currently **not** supported by K8up: running a pre-backup command, and THEN back up some data.
+When using a backup command, it is expected that the backup command prints the data that you want to backup to stdout.
+This is a bit unusual, but it's a very flexible approach. You can backup anything you want,
+as long as you can write a command that prints the data to stdout. This includes binary data, see below!
+
+> [!NOTE]
+> For details on how to install K8up, kindly refer to their official documentation, we'll not cover this here.
+
+# Prerequisites
+
+Before adding annotations (in fact, the order doesn't matter, but annotations won't do anything unless the objects
+describe below are created), we need to create a few resources - mainly secrets (at least containing the restic **password**,
+and other secrets depending on the backend chosen) and either a `Backup` (one-time) or `Schedule` (recurring) resource.
+
+> [!IMPORTANT]
+> The `Backup` / `Schedule` resource must be created in the **same namespace** as the object to be backed up. In addition, the
+> secrets must be created in the same namespace as well.
+
+## Secrets
+
+> [!TIP]
+> K8up allows to define some global settings, which are then applied across all namespaces, this is not implemented yet
+> for all backends though. It is possible to define the restic password and S3 credentials globally, but Azure Blob
+> Storage credentials (any many others) are not supported yet. Check the [global operator reference](https://docs.k8up.io/k8up/2.11/references/operator-config-reference.html)
+> for options prefixed with `--global` for supported global settings.
+
+Depending on the chosen [restic backend](https://restic.readthedocs.io/en/latest/030_preparing_a_new_repo.html), you need
+different credentials. Refer to the K8up API reference for the [`Backend` spec](https://docs.k8up.io/k8up/2.11/references/api-reference.html#k8s-api-github-com-k8up-io-k8up-v2-api-v1-backend)
+for supported backends and then checkout the respective backend spec for required secrets. In our case, we want to backup
+to Azure Blob, therefore when inspecting the [`AzureSpec`](https://docs.k8up.io/k8up/2.11/references/api-reference.html#k8s-api-github-com-k8up-io-k8up-v2-api-v1-azurespec),
+we see that we need the following secrets:
+
+- `repoPasswordSecretRef` (from the backend spec)
+- `accountNameSecretRef` (from the Azure spec)
+- `accountKeySecretRef` (from the Azure spec)
+
+In our environment, we're syncinc the secret(s) from HashiCorp Vault, so we're not going to cover this here. The following
+example should get you started though:
+
+```bash
+echo -n 'very_secure_password' > RESTIC_PASSWORD         
+echo -n '<azure_storage_account_name>' > AZURE_ACCOUNT_NAME
+echo -n '<azure_storage_account_key>' > AZURE_ACCOUNT_KEY
+kubectl create secret generic -n your_namespace secret_name --from-file=./RESTIC_PASSWORD --from-file=./AZURE_ACCOUNT_NAME --from-file=./AZURE_ACCOUNT_KEY
+rm RESTIC_PASSWORD AZURE_ACCOUNT_NAME AZURE_ACCOUNT_KEY
+```
+
+> [!NOTE]
+> It is currently not possible to use SAS tokens instead of the account key, even though restic does support it.
+> There is an [open issue](https://github.com/k8up-io/k8up/issues/1016) for this.
+
+## Backup / Schedule
+
+The next step is to create a backup `Schedule` and therefore tell K8up what to do. Basically, it maps the secrets
+defined before to the actual backup process. It will automatically target all resources in the same namespace. The
+`Schedule` is also the place where we define **retention settings**, **pruning** and regular check intervals. 
+You'll need a few parameters to create the schedule:
+
+- `__your_schedule_name__`: The name of the schedule, e.g. `daily-backup`
+- `__your_namespace__`: The namespace where the backup should be performed
+- `__secret_name__`: The name of the secret created before
+- `__container_name__`: The name of the Azure Blob Storage container
+
+This is one example from our environment, please refer to the [`Schedule documentation`](https://docs.k8up.io/k8up/2.11/how-tos/schedules.html)
+and the [API reference](https://docs.k8up.io/k8up/2.11/references/api-reference.html#k8s-api-github-com-k8up-io-k8up-v2-api-v1-schedulespec) for more details on what is supported. You'll need to adjust the placeholders accordingly.
+
+```yaml:k8s-schedule.yaml
+---
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: __your_schedule_name__
+  namespace: __your_namespace__
+spec:
+  backend:
+    repoPasswordSecretRef:
+      name: __secret_name__
+      key: RESTIC_PASSWORD
+    azure:
+      container: __container_name__
+      path: /__your_namespace__
+      accountNameSecretRef:
+        name: __secret_name__
+        key: AZURE_ACCOUNT_NAME
+      accountKeySecretRef:
+        name: __secret_name__
+        key: AZURE_ACCOUNT_KEY
+  backup:
+    schedule: '@daily-random'
+    failedJobsHistoryLimit: 2
+    successfulJobsHistoryLimit: 2
+  check:
+    schedule: '@daily-random'
+    failedJobsHistoryLimit: 2
+    successfulJobsHistoryLimit: 1
+  prune:
+    schedule: '@daily-random'
+    failedJobsHistoryLimit: 2
+    successfulJobsHistoryLimit: 1
+    retention:
+      keepLast: 24
+      keepDaily: 14
+      keepWeekly: 4
+      keepMonthly: 12
+      keepYearly: 5
+```
+
+A few important notes:
+
+- We're running secrets across multiple namespaces. To avoid all backup and pruning jobs running at the very same time, we're using `@daily-random` schedules. This will spread the jobs across the day.
+- For each schedule, K8up spawns a `Job` resource. The `failedJobsHistoryLimit` and `successfulJobsHistoryLimit` settings define how many of those jobs are kept, mainly used for debugging and monitoring.
+- By default, K8up will unconditionally backup everything (all PVCs) in the namespace. Personally I don't like that behaviour and would rather opt-in (also because I don't think volume backups to be particularly useful very often, see below), therfore I've set `k8up.skipWithoutAnnotation` to `true`. This means that only PVCs (or Pods) with the `k8up.io/backup` annotation set to `true` will be backed up.
+- Depending on your K8s environment and the security policy, you may need to specify a `podConfigRef`. We're using [Talos](https://www.talos.dev/), which does require a few security settings to work. I'll be covering this in a separate post. 
+
+# Backing up Data - The actual annotations
+
+Now that we're created all required resources, we can finally start with backing up something.
+Volume backups do not allow to run any pre- or post-backup commands. It is therefore not possible to (a) run a database dump
+and then backup the resulting file or (b) somehow quiesce the application before taking a backup. You can snapshot the PVC
+before taking the backup (provided that your storage class supports this), but even then this does not guarantee you
+application-consistent backups. Both examples below are therefore using application-aware backups.
+
+Should you want to use volume backups, all you need to do is to annotate the PVCs you want to backup:
+
+```yaml
+annotations:
+  k8up.io/backup: "true"
+```
+
+## Example 1: PostgreSQL
+
+To run application-aware backups, its first important to understand that the annotations must be
+set on the pod, not the PVC. This is because the backup command is executed in the pod. Next, the backup command
+itself is important - it needs to collect all the data that is to be backed up and needs to print it to stdout.
+Restic will encrypt the data, so you don't need to worry about that at this stage. Textual data is preferred,
+as its easier to run deduplication on it.
+
+For Postgres, we can simply run a `pg_dumpall` command, which prints the command to stdout. Therefore, the following
+three annotations are required:
+
+```yaml
+annotations:
+  k8up.io/backup: "true"
+  k8up.io/backupcommand: "sh -c 'PGPASSWORD=\"$POSTGRES_PASSWORD\" pg_dumpall -U postgres --clean'"
+  k8up.io/file-extension: ".sql"
+```
+
+The `file-extension` annotation is optional, but it helps to identify the backup files later on.
+
+## Example 2: EMQX Broker (binary file backup)
+
+EMQX is an MQTT broker, which also stores things like ACLs, certificates and more on the PVC.
+Backup and restore is described [in their documentation](https://docs.emqx.com/en/emqx/latest/operations/backup-restore.html),
+however it essentially boils down to running a specific command, which will then create an archive of all the data:
+
+```bash
+$ ./emqx ctl data export
+Exporting data to "data/backup/emqx-export-2023-06-19-15-14-19.947.tar.gz"...
+Exporting cluster configuration...
+Exporting additional files from EMQX data_dir: "data"...
+Exporting built-in database...
+Exporting emqx_admin database table...
+Exporting emqx_authn_mnesia database table...
+Exporting emqx_enhanced_authn_scram_mnesia database table...
+Exporting emqx_app database table...
+Exporting emqx_acl database table...
+Exporting emqx_psk database table...
+Exporting emqx_banned database table...
+Data has been successfully exported to data/backup/emqx-export-2023-06-19-15-14-19.947.tar.gz.
+```
+
+It doesn't conveniently stream the result to stdout, but instead creates a file. We need to work around this
+a little bit to make it work with K8up:
+
+```yaml
+annotations:
+    k8up.io/backup: "true"
+    k8up.io/backupcommand: "sh -c '/opt/emqx/bin/emqx ctl data export>/dev/null && cat /opt/emqx/data/backup/emqx-export-*tar.gz && rm /opt/emqx/data/backup/emqx-export-*tar.gz>/dev/null'"
+    k8up.io/file-extension: ".tar.gz"
+```
+
+There are a few interesting details to note:
+
+- As we're backing up via stdout, we cannot have the actual backup command print anything to stdout. Therefore, we're redirecting the output to `/dev/null`.
+- The `cat` command will print the binary data to stdout, which is then picked up by K8up and restic. It seems a bit weird, but works perfectly fine.
+- We're deleting the file after the backup is done. This is important, as the file will be created in the pod, and we don't want to fill up the disk.
+
+# Conclusion
+
+K8up is a very flexible backup solution for Kubernetes, which allows you to backup data only.
+This post showed how to backup a PostgreSQL database and an EMQX broker, but the same principle can be applied to
+any other application. Note that volume backups probably have their place as well, we've not found a good use
+case for them yet though.
