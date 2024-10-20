@@ -1,0 +1,85 @@
+---
+title: HashiCorp Vault Open Source - Raft Automatic Backup
+date: '2024-10-21'
+tags: ['kubernetes', 'vault', 'backup']
+draft: false
+summary: Automated backup procedures for HashiCorp Vault is only available in the Enterprise edition. This blog post shows how to setup automatic backup (based on raft storage snapshots) including minimalistic permissions for the backup service account.
+---
+
+This is going to be a very short post on how to setup automated backup of HashiCorp Vault Open Source edition.
+It does require the use of the raft storage backend.
+If you're interested in migrating from file to raft storage, please refer to [this previous blog post](/blog/hashicorp-vault-raft-migration).
+
+# Policy and Role for Backup
+
+As a first step, we need to create a policy that allows nothing but creating a snapshot:
+
+```bash
+echo '
+path "sys/storage/raft/snapshot" {
+   capabilities = ["read"]
+}' | vault policy write pol-snapshot -
+```
+
+We're then going to setup an [AppRole authentication method](https://developer.hashicorp.com/vault/docs/auth/approle)
+for this purpose. According to the docs, this auth method `allows machines or apps to authenticate with Vault-defined roles`,
+which seems like a good fit for our backup service.
+
+```bash
+# Enable the AppRole auth method
+vault auth enable approle
+
+# Referring to the previously created policy and choosing a short TTL, create a role for the snapshot agent
+vault write auth/approle/role/backup-snapshot token_ttl=30m token_policies=pol-snapshot
+
+# Retrieve the role ID
+vault read auth/approle/role/backup-snapshot/role-id -format=json | jq -r .data.role_id
+
+# Generate a secret and retrieve the ID
+vault write -f auth/approle/role/backup-snapshot/secret-id -format=json | jq -r .data.secret_id
+```
+
+# Configure the Backup
+
+In my case, I want to use K8up to take the backups.
+There's another blog post on how to use and setup K8up, which you can find [here](/blog/k8s-backup-with-k8up).
+Assuming K8up is already setup for the namespace correctly, we're now adding the proper secrets and annotations
+to the HashiCorp Vault pod.
+
+We cannot really use secrets synced from Vault, as this would be a chicken-egg problem. Therefore, we create
+the secret manually:
+
+```yaml:backup-secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-backup
+  namespace: __your_vault_namespace__
+stringData:
+  VAULT_BACKUP_ROLE_ID: __role-id__
+  VAULT_BACKUP_SECRET_ID: __secret-id__
+```
+
+And then add the following annotations to the Vault pod via the Helm chart:
+
+```yaml:backup-annotations.yaml
+server:
+  extraSecretEnvironmentVars:
+    - name: VAULT_BACKUP_ROLE_ID
+      secretName: vault-backup
+      secretKey: VAULT_BACKUP_ROLE_ID
+    - name: VAULT_BACKUP_SECRET_ID
+      secretName: vault-backup
+      secretKey: VAULT_BACKUP_SECRET_ID
+  annotations:
+    k8up.io/backup: "true"
+    k8up.io/backupcommand: "sh -c 'wget -q -O /home/vault/jq https://github.com/stedolan/jq/releases/download/jq-1.7.1/jq-linux64 && chmod +x /home/vault/jq && export VAULT_TOKEN=$(vault write auth/approle/login role_id=$VAULT_BACKUP_ROLE_ID secret_id=$VAULT_BACKUP_SECRET_ID -format=json | /home/vault/jq -r .auth.client_token) && vault operator raft snapshot save /home/vault/vault-backup.snap && cat /home/vault/vault-backup.snap && rm /home/vault/vault-backup.snap'"
+    k8up.io/file-extension: ".snap"
+```
+
+There's a few things to note here:
+
+- We're using `jq` to parse the JSON output of the `vault write` command. Personally I don't like installing this during runtime too much, the alternative would be to use a custom build image or a separate container.
+- The filename is lost when copying the data via stdout and `cat`, therefore we're adding the `.snap` extension back again.
+
+If you have a nicer way to do this, please let me know!

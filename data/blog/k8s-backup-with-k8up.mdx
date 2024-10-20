@@ -203,9 +203,9 @@ a little bit to make it work with K8up:
 
 ```yaml
 annotations:
-    k8up.io/backup: "true"
-    k8up.io/backupcommand: "sh -c '/opt/emqx/bin/emqx ctl data export>/dev/null && cat /opt/emqx/data/backup/emqx-export-*tar.gz && rm /opt/emqx/data/backup/emqx-export-*tar.gz>/dev/null'"
-    k8up.io/file-extension: ".tar.gz"
+  k8up.io/backup: "true"
+  k8up.io/backupcommand: "sh -c '/opt/emqx/bin/emqx ctl data export>/dev/null && cat /opt/emqx/data/backup/emqx-export-*tar.gz && rm /opt/emqx/data/backup/emqx-export-*tar.gz>/dev/null'"
+  k8up.io/file-extension: ".tar.gz"
 ```
 
 There are a few interesting details to note:
