@@ -1,0 +1,195 @@
+---
+title: Migrating HashiCorp Vault from File to Raft Storage in Kubernetes
+date: '2024-10-20'
+tags: ['kubernetes', 'vault']
+draft: false
+summary: HashiCorp vault supports multiple storage backends. The default helm values will install using the file backend, which is not recommended for production. This post shows how to migrate from file to raft storage, including covering some GitOps pitfalls.
+---
+
+# Overview
+
+[HashiCorp Vault](https://www.vaultproject.io/) is a popular tool for managing secrets and protecting sensitive data.
+It supports multiple storage backends, namely Consul, raft and file. The file backend is the default when installing
+Vault via Helm, but comes with a few limitations. Most notably, the [documented backup procedures](https://developer.hashicorp.com/vault/tutorials/standard-procedures/sop-backup#manual-backup-procedures)
+require raft storage and its snapshot capabilities. Using file storage it is theoretically possible to backup the data,
+but there's no guarantee that the data is consistent unless the vault server is stopped.
+
+We had Vault deployed in our Kubernetes cluster using the file backend, including a decent number of
+secret engines (mainly KV and PKI). We've therefore decided to migrate from file to raft, mainly to
+make use of the snapshot capabilities and including it in our K8up backups.
+
+The general process will be as follows:
+
+- Take a backup of the existing Vault data
+- Use the `vault operator migrate` command to migrate the data from file to raft storage
+- Modify the Helm deployment to use raft storage and redeploy the Vault server
+- (Optional): adjust ArgoCD application settings to work around ArgoCD modifying Pod values
+
+# Backup the existing Vault data
+
+First of all we need to take a consistent backup of the data.
+As mentioned above, we can only guarantee consistency if the Vault server is stopped, which however also means that the pod is not available to run any commands.
+The steps are:
+
+1. (Optional) If using ArgoCD or any other GitOps tool, disable auto-sync
+2. Scale down the Statefulset to 0 replicas, wait for the pod to be terminated
+3. Deploy a temporary pod mounting the existing PVC to take a backup
+
+```yaml:migration-backup.yaml
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: migration-backup
+  namespace: core-vault
+spec:
+  containers:
+  - name: migration-backup
+    image: busybox
+    args:
+    - sleep
+    - "1000000"
+    volumeMounts:
+      - name: source
+        mountPath: /data-source
+  volumes:
+    - name: source
+      persistentVolumeClaim:
+        claimName: data-vault-0
+        readOnly: true
+```
+
+4. Launch the pod (`kubectl apply -f migration-backup.yaml`) and get a shell (`kubectl exec -ti migration-backup /bin/sh`)
+5. Use `tar` to create a backup of the data (`tar czf /tmp/backup.tar.gz /data-source/`)
+6. Copy the backup to a safe location (`kubectl cp migration-backup:/tmp/backup.tar.gz ./backup.tar.gz`)
+7. Delete the temporary pod (`kubectl delete -f migration-backup.yaml`)
+
+Next, restart the Vault server by scaling the Statefulset back to 1 and unseal the vault if no auto-unseal is configured.
+
+# Data Format Migration
+
+The next step is to actually migrate data from file to raft storage format.
+This is relatively simple, as the `vault operator migrate` command does all the heavy lifting.
+
+1. Launch a shell in the Vault pod (`kubectl exec -ti vault-0 /bin/sh`)
+2. Create the migration configuration file (`/home/vault/migrate.hcl`):
+
+```hcl:migrate.hcl
+storage_source "file" {
+ path = "/vault/data/"
+}
+ storage_destination "raft" {
+ path = "/vault/data/"
+}
+cluster_addr = "https://vault-0.vault-internal:8201"
+```
+
+3. Run the migration command (`vault operator migrate -config=/home/vault/migrate.hcl`)
+
+Depending on the amount of data, this can take a while. The command will output progress information.
+
+# Redeploy Vault Resources
+
+The last step is to modify the Helm deployment to use raft storage and redeploy the Vault server.
+Essentially, what we need to do is:
+
+- Enable HA using `server.ha.enabled` and `server.ha.replicas` values. You can set the number of replicas to 1 for now.
+- Enable raft storage using `server.ha.raft.enabled`
+- **Move the configuration** (if you have changed it in the first place, otherwise you can skip this step) from `server.standalone.config` to `server.ha.raft.config` and adjust a couple of values (see below)
+
+```diff:config
+  ui = true
+  listener "tcp" {
+    // ...
+  }
+- storage "file" {
++ storage "raft" {
+    path = "/vault/data"
+  }
+
++ service_registration "kubernetes" {}
+```
+
+You then need to reinstall the helm chart with the new values. In our case we're using ArgoCD, so the steps
+are to delete the application with all its content, modify the values and then have ArgoCD re-sync the application.
+This should bring up the new Vault server using raft storage.
+If no auto-unseal is configured, you will need to unseal the vault again.
+You should now be left with a health Vault status, indicating HA and raft status similar to this:
+
+```shell
+$ vault status
+Key                      Value
+---                      -----
+Seal Type                azurekeyvault
+Recovery Seal Type       shamir
+Initialized              true
+Sealed                   false
+Total Recovery Shares    5
+Threshold                3
+Storage Type             raft
+Cluster Name             vault-cluster-xxx
+Cluster ID               xxxx-f912-46cb-a010-xxxx
+HA Enabled               true
+HA Cluster               https://vault-0.vault-internal:8201
+HA Mode                  active
+Raft Committed Index     1185
+Raft Applied Index       1185
+```
+
+# ArgoCD Pitfalls
+
+Vault is a bit special in that it modifies the pod's labels depending on the state of the pod.
+These labels are then used as selector, for example for the service.
+In a default configuration this will not work and end up with a service without endpoint, as ArgoCD will auto-sync and purge the labels from the Pod again.
+For example the `vault-active` service:
+
+```yaml:svc/vault-active
+k get svc vault-active -o yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault-active
+spec:
+  selector:
+    app.kubernetes.io/instance: vault
+    app.kubernetes.io/name: vault
+    component: server
+    vault-active: "true"
+```
+
+Note the `vault-active` label and compare against the labels of a healthy pod:
+
+```yaml:pod/vault-0
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: vault-
+  labels:
+    app.kubernetes.io/instance: vault
+    app.kubernetes.io/name: vault
+    apps.kubernetes.io/pod-index: "0"
+    component: server
+    helm.sh/chart: vault-0.28.1
+    statefulset.kubernetes.io/pod-name: vault-0
+    vault-active: "true"
+    vault-initialized: "true"
+    vault-perf-standby: "false"
+    vault-sealed: "false"
+    vault-version: 1.17.2
+  name: vault-0
+```
+
+In order for ArgoCD to not purge these labels, we need to make use of the [`ignoreDifferences` diff customization](https://argo-cd.readthedocs.io/en/stable/user-guide/diffing/) in the application manifest:
+
+```yaml:
+spec:
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle
+    - kind: Pod
+      name: vault-0
+      jsonPointers:
+        - /metadata/labels/vault-active
+```
