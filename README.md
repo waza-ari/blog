@@ -6,7 +6,7 @@ It is based on the awesome template [tailwind-nextjs-starter-blog](https://githu
 ## Running locally
 
 - Adjust `.env.local` file based on the example file
-- Run `yarn` followed by `yarn dev` 
+- Run `npm install` followed by `npm run dev` 
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
