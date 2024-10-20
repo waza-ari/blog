@@ -1,0 +1,20 @@
+version: '3'
+
+dotenv: ['.env', '{{.ENV}}/.env.', '{{.HOME}}/.env']
+
+tasks:
+  publish:
+    cmds:
+      - npm run build
+      - rsync -r --progress .next/standalone/ wazaari.dev:/home/dherrman/blog
+      - rsync -r --progress public wazaari.dev:/home/dherrman/blog/
+      - rsync -r --progress .next/static wazaari.dev:/home/dherrman/blog/.next/
+      - ssh wazaari.dev "supervisorctl restart blog"
+  
+  setup:
+    cmds:
+      - ssh wazaari.dev "mkdir -p /home/dherrman/blog/.next"
+      - task publish
+      - scp .env.local wazaari.dev:/home/dherrman/blog/.env
+      - scp blog.ini wazaari.dev:/home/dherrman/etc/services.d/blog.ini
+      - ssh wazaari.dev "cd /home/dherrman/blog && uberspace tools version use node 20 && supervisorctl reread && supervisorctl update && uberspace web backend set / --http --port 3000"
