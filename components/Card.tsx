@@ -1,7 +1,7 @@
 import Image from './Image'
 import Link from './Link'
 
-const Card = ({ title, description, imgSrc, href }) => (
+const Card = ({ title, description, imgSrc, href, github, docs }) => (
   <div className="md max-w-[544px] p-4 md:w-1/2">
     <div
       className={`${
@@ -38,6 +38,7 @@ const Card = ({ title, description, imgSrc, href }) => (
             title
           )}
         </h2>
+
         <p className="prose mb-3 max-w-none text-gray-500 dark:text-gray-400">{description}</p>
         {href && (
           <Link
@@ -47,6 +48,17 @@ const Card = ({ title, description, imgSrc, href }) => (
           >
             Learn more &rarr;
           </Link>
+        )}
+        {docs && (
+          <p>
+            <Link
+              href={docs}
+              className="text-base font-medium leading-6 text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+              aria-label={`Link to ${title}`}
+            >
+              Straight to the documentation &rarr;
+            </Link>
+          </p>
         )}
       </div>
     </div>
