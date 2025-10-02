@@ -1,0 +1,226 @@
+---
+title: OpenSearch per Document Monitor with findings using Data Streams
+date: '2025-10-01'
+tags: ['opensearch', 'logging', 'fluentd']
+draft: false
+images: ['/static/images/truenas-talos-democratic-csi/truenas-users.png', '/static/images/truenas-talos-democratic-csi/nfs-datasets.png', '/static/images/truenas-talos-democratic-csi/nfs-permissions.png', '/static/images/truenas-talos-democratic-csi/iscsi-settings.png', '/static/images/truenas-talos-democratic-csi/iscsi-portal.png', '/static/images/truenas-talos-democratic-csi/iscsi-datasets.png']
+summary: This blog post explores how to set up OpenSearch Data Streams for log ingestion from multiple applications/systems, automatically creating data streams, applying retention policies, and configuring per-document monitors to notify on specific events.
+---
+
+[OpenSearch](https://opensearch.org) is a community-driven, Apache 2.0-licensed open source search and analytics suite
+that makes it easy to ingest, search, visualize, and analyze data. OpenSearch supports a variety of use cases,
+most notably observability, search, machine learning and security analytics. Data (documents) are organized into indices,
+which are basically buckets of similar (related) documents. The OpenSearch documentation has a [great overview of
+these concepts](https://docs.opensearch.org/latest/getting-started/intro/), which I recommend reading.
+
+For various reasons the indices should be kept reasonably small, first and foremost for performance reasons.
+However also retention settings are important as data gets deleted by deleting the index, therefore
+you don't want to have a single index that contains years of data. This would typically be solved by
+using various techniques such as time-based indices (e.g. one index per day/week/month) or index aliases
+and index rollover.
+
+# Data Streams
+
+For those specific reasons, OpenSearch introduced [Data Streams](https://docs.opensearch.org/latest/im-plugin/data-streams/).
+Data streams encapsulate best practices for managing time-series data in OpenSearch and don't require you
+to manually manage index lifecycle policies, rollover aliases, or write indices. In this post we're quickly
+going to explore how to use data streams in combination with a per-document monitor.
+
+# Data Ingestion and Data Stream Creation
+
+The process to create data streams manually is explained fairly well in the OpenSearch documentation.
+For our setup we want to support multiple different applications and systems logging into OpenSearch,
+ideally creating a new data stream for each application/system automatically.
+
+The goals are therefore so setup an environment that:
+
+- Supports multiple different applications/systems logging into OpenSearch
+- Automatically creates a new data stream for each application/system
+- Apply retention settings (e.g. delete data older than 30 days)
+- Create a per-document monitor that notifies us of specific events
+
+## Index Names
+
+A word of warning first - there are certain **contraints on index names**, which are documented
+in the [OpenSearch documentation](https://docs.opensearch.org/latest/im-plugin/#naming-restrictions-for-indexes).
+There is one undocumented restriction though which I ran into - while its technically possible and allowed
+to use dots in your index name (e.g. `app.myapp` or `syslog.myhost`), there are issues when trying to use
+those indices in a monitor.
+
+If you try to use an index with a dot in its name, you'll get weird error like this:
+`Index patterns are not supported in doc level monitors`. I do not understand why OpenSearch
+mistakenly assumes those indices to be index patterns, but renaming the indices to not contain
+dots solved the issue.
+
+## Ingesting Data
+
+We're using [Fluentd](https://www.fluentd.org) to ingest log data into OpenSearch, but ultimately the
+way how data gets into OpenSearch doesn't matter too much. We just need to make sure that OpenSearch
+creates the datastreams automatically. For this, we create an **index template** first, which will
+apply certain settings to any new index that gets created.
+
+```
+PUT _index_template/ds-template
+{
+  "index_patterns": [
+    "app-*",
+    "syslog-*",
+    "other"
+  ],
+  "data_stream": {},
+  "priority": 100
+}
+```
+
+This index template will match any index that starts with `app-` or `syslog-`, as well as
+the exact index name `other`. The `data_stream` setting tells OpenSearch to **create a
+data stream** for any new index that matches this template. Creating a data stream means that
+OpenSearch will automatically create a data stream managed index (`.ds-app-backend-000001`).
+Of course you can and should use all other features of index templates, such as mappings 
+and replication settings, please refer to [the documentation](https://docs.opensearch.org/latest/im-plugin/index-templates/)
+for details.
+
+## Excurse: FluentD Configuration
+
+When using FluentD to ingest your data into OpenSearch there are two important settings for
+the [fluent-plugin-opensearch](https://github.com/fluent/fluent-plugin-opensearch) output plugin:
+
+- **Index name**: you obviously need to set the index correctly. Just use the name of the data stream,
+    you don't need to do the date based index name suffixes in fluentd anymore. 
+- **write_operation**: this needs to be set to `create` when using data streams, the default of `index``
+    will not work.
+- **id related settings**: when using `create` as write operation, you need to make sure that
+    you set a unique `_id` for each document. You can either make sure that there is a unique
+    field called `_id` in your log data already, or you can have fluentd generate a hashed ID
+    for you.
+
+Here is an example fluentd configuration snippet that shows how to configure the OpenSearch output plugin:
+
+```
+<match **>
+    @type opensearch
+    host "#{ENV['FLUENT_OPENSEARCH_HOST']}"
+    # All your other settings like connection, buffer, retry, ...
+    
+    # Set the index based on the field with a fallback to other
+    target_index_key target_index
+    index_name other
+
+    # Write operation must be create for data streams
+    write_operation create
+    id_key _hash
+    remove_keys _hash
+</match>
+```
+
+## Retention and rollover
+
+Data streams automatically create a backing index, but it doesn't automatically rollover to new indices
+(as that would depend on your specific use case) and it will also not delete old data automatically. We
+therefore use an **Index State Management (ISM) policy** to configure retention and rollover settings.
+
+The following example ISM policy will rollover the index after 1 day (creating daily indices) and
+delete indices older than 14 days. You can use the `index_patterns` to define which data streams
+this policy should apply to and use the `priority` to define defaults. This example applies the
+14d policy to all data streams starting with `app-`, you could however create another policy
+with a higher priority applying to something more specific (e.g. `app-critical-*`) with a different
+retention setting.
+
+```
+PUT _plugins/_ism/policies/ds_daily_rollover_14d
+{
+    "policy": {
+        "description": "Daily Rollover 14d retention",
+        "default_state": "rollover",
+        "states": [
+            {
+                "name": "rollover",
+                "actions": [
+                    {
+                        "rollover": {
+                            "min_index_age": "1d"
+                        }
+                    }
+                ],
+                "transitions": [
+                    {
+                        "state_name": "delete",
+                        "conditions": {
+                            "min_index_age": "14d"
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "delete",
+                "actions": [
+                    {
+                        "delete": {}
+                    }
+                ],
+                "transitions": []
+            }
+        ],
+        "ism_template": [
+            {
+                "index_patterns": [
+                    "app-*",
+                    "syslog-*",
+                    "other"
+                ],
+                "priority": 50
+            }
+        ]
+    }
+}
+```
+
+# Create a Per-Document Monitor
+
+Now that we have the data in OpenSearch we want to be notified on certain individual events,
+for example if there's a log event with log level `error` coming in. For those individual findings,
+a per document monitor is the right choice. First we need a notifiaction cahnnel, creating
+those is fairly well documented in the [OpenSearch documentation](https://docs.opensearch.org/latest/observing-your-data/notifications/index/).
+
+Next, we have to create the per [document monitor](https://docs.opensearch.org/latest/observing-your-data/alerting/per-document-monitors/).
+For this, we go to **Menu** > **OpenSearch Plugins** > **Alerting** and switch to the **Monitors** tab. Here, we click **Create Monitor**.
+
+- Give it a name and select **Per-Document Monitor**
+- Stick with the visual editor and define how often the monitor should be executed.
+  Depending on your use case you might want to run it every minute, or every 5/10 minutes.
+- Next, enter the data stream you want the monitor to run against, e.g. `app-backend`.
+  Note that you cannot select the data stream from the drop down, you have to type it as custom option.
+- You can now define one or multiple queries that will be executed against the data stream.
+  For each query (or a combination of conditions) you can define triggers later which will actually notify you.
+- Add a trigger notifying you via your preferred notification channel. For example:
+  - Trigger name: `Error-level log detected`
+  - Severity: `Highest`
+  - Trigger conditions: Pick one query defined above or define your own condition
+  - Define one or multiple actions, e.g. send an email or a Slack message
+  - Select `Per alert` in the alert configuration section
+
+The error message and notification will get more useful the more context we put into it. 
+While the [trigger documentation](https://docs.opensearch.org/latest/observing-your-data/alerting/triggers/) lists
+which variables are available, it doesn't really explain the format of those. I want to mention two tricks:
+
+1. You can use `{{#toJson}}ctx.results{{/toJson}}` to print the entire result of the query in JSON format.
+   This will give you a good overview of which fields are available and how to access them.
+   The same method can also be used for other variables and can be extremly useful to message composition.
+2. Unfortunately this doesn't include the actual document (`sample_documents`) in a reliable way,
+    which seems like a bug to me. It will be filled though. One example is given below.
+
+```mustache
+A backend error has been detected in the {{ctx.alerts.0.sample_documents.0._source.component}} component!
+
+Log: {{ctx.alerts.0.sample_documents.0._source.event}} 
+Request ID: {{ctx.alerts.0.sample_documents.0._source.event}} 
+Affected User ID: {{ctx.alerts.0.sample_documents.0._source.user}}
+```
+
+# Conclusion
+
+Data Streams greatly simplify the management of time-series data in OpenSearch and
+still give you the option to use per-document monitoring to act upon findings.
+we can enrich the notification messages with relevant information from the log data.
+I hope this post can save you some headaches circumventing the issues I ran into
+that unfortunately did cost me a lot of hours to figure out.
