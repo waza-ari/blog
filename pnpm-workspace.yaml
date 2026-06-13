@@ -1,0 +1,16 @@
+allowBuilds:
+  contentlayer2: true
+  esbuild: true
+  protobufjs: true
+  sharp: true
+  unrs-resolver: true
+
+# Force a single next-themes version across the tree. pliny's Giscus component
+# depends on next-themes@^0.3.0, which pnpm otherwise installs as a separate copy
+# from the app's 0.4.6. next-themes shares the active theme via a React Context,
+# and each copy defines its own Context — so pliny's useTheme() reads an
+# un-provided context and giscus never honors the site theme. Pinning to one
+# version dedupes to a single shared context.
+# See https://github.com/timlrx/pliny/issues/202
+overrides:
+  next-themes: 0.4.6
