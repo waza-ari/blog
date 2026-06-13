@@ -4,7 +4,7 @@ const siteMetadata = {
   author: 'Daniel Herrmann',
   headerTitle: 'Daniels Techblog',
   description:
-    "This blog is covering a variety of topics, both related to my work as Senior Solution Architect in the infrastructure field as well as to my free time activities. You'll find hopefully find something useful regarding infrastructure topics (mainly networking, security and Azure), DevOps and GitOps, Kubernetes or Development (mainly Python for the backend and NextJS / TypeScript for the frontend), and the ocasional hardware topics as well.",
+    "This blog is covering a variety of topics, both related to my work as Principal Solution Architect in the infrastructure field as well as to my free time activities. You'll find hopefully find something useful regarding infrastructure topics (mainly networking, security and Azure), DevOps and GitOps, Kubernetes or Development (mainly Python for the backend and NextJS / TypeScript for the frontend), and the ocasional hardware topics as well.",
   language: 'en-us',
   theme: 'system', // system, dark or light
   siteUrl: 'https://wazaari.dev',
